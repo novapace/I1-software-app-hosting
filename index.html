@@ -346,14 +346,23 @@ var CAL_MS = 20000;
 // Spule sitzt wenige Millimeter neben dem Kompass. Ob das am Geraet ueberhaupt
 // stoert, ist nicht gemessen -- BUZZ_QUIET_S ist der Nachlauf nach dem Impuls
 // und laesst sich auf 0 setzen, falls nicht. Die Luecke kostet die Messung
-// des naechsten Schritts (sway() verwirft Fenster mit Loch, s. GAP_MAX_S).
+// des naechsten Schritts (sway() verwirft zu duenne Fenster, s. MIN_COVER).
 var quietUntil = 0;
 var BUZZ_QUIET_S = 0.1;
-// Groesste erlaubte Luecke im Messfenster, Fensterraender eingeschlossen.
-// Ein Fenster mit Loch saehe nur einen Teil des Schwungs und laese ihn zu
-// KLEIN -- also genau in die Richtung, die einen Reiz ausloest. Lieber kein
-// Wert als ein zu kleiner. 0,25 s sind drei ausgefallene Samples bei 12,5 Hz.
-var GAP_MAX_S = 0.25;
+// Mindestanteil der erwarteten Samples im Messfenster. Ein Fenster mit Loch
+// saehe nur einen Teil des Schwungs und laese ihn zu KLEIN -- also genau in
+// die Richtung, die einen Reiz ausloest. Lieber kein Wert als ein zu kleiner.
+//
+// Gezaehlt, nicht an Zeitluecken gemessen. Die Zeitstempel sind die Zeit, zu
+// der onMag() LAEUFT, nicht die der Messung: ist die Uhr gerade mit Zeichnen
+// beschaeftigt, warten die Kompasswerte in der Ereignis-Warteschlange und
+// kommen danach dicht hintereinander an. Ein Lueckentest (bis 2026-10-26)
+// hat genau das als Loch gelesen und nach jedem Neuzeichnen den naechsten
+// Schritt verworfen -- im Feldtest fehlte so jeder zweite Wert. Die Werte
+// selbst waren in Ordnung; verloren geht nur, was der Motor-Nachlauf
+// (quietUntil) bewusst auslaesst, und das faengt die Zaehlung ab.
+var POLL_HZ = 12.5;   // Bangle.setPollInterval(80) unten
+var MIN_COVER = 0.7;
 var CUE_MS = 8000;
 var ui = { sway: null, thr: 0, cue: null, cueTimer: 0, linked: NRF.getSecurityStatus().connected };
 
@@ -401,10 +410,7 @@ function sway(ms) {
   }
   var n = ix.length;
   if (n < 6) return { t: "s", a: null, why: "n", n: n };
-  // ix laeuft vom neuesten zum aeltesten Sample.
-  var gap = Math.max(getTime() - bt[ix[0]], bt[ix[n - 1]] - from);
-  for (j = 1; j < n; j++) gap = Math.max(gap, bt[ix[j - 1]] - bt[ix[j]]);
-  if (gap > GAP_MAX_S) return { t: "s", a: null, why: "gap", n: n };
+  if (n < MIN_COVER * POLL_HZ * ms / 1000) return { t: "s", a: null, why: "n", n: n };
   var x, y, z, mx = 0, my = 0, mz = 0, f = 0;
   for (j = 0; j < n; j++) {
     i = ix[j]; x = bx[i]; y = by[i]; z = bz[i];
@@ -607,12 +613,21 @@ function draw() {
   g.setFont("Vector", 30).drawString(two(d.getHours()) + ":" + two(d.getMinutes()), W / 2, 20);
   LOGO.palette = new Uint16Array([0, g.toColor(0, 1, 0), g.toColor(0, 1, 1), 0]);
   g.drawImage(LOGO, (W - LOGO.width) / 2, 40);
+  drawFoot();
+}
+
+// Nur die unterste Zeile. Nach jeder Messung reicht das, und es ist billig:
+// ein ganzes Neuzeichnen (Logo, Uhrzeit) haelt die Uhr so lange auf, dass
+// die Kompasswerte in der Warteschlange stauen (s. MIN_COVER).
+function drawFoot() {
+  var W = g.getWidth();
   var foot = !cal ? "nicht kalibriert"
            : !ui.linked ? "Telefon getrennt"
            : ui.sway == null ? ""
            : "Arm " + Math.round(ui.sway) + "\xB0" + (ui.thr > 0 ? " \xB7 Ziel " + ui.thr + "\xB0" : "");
+  g.reset().setBgColor(0, 0, 0).clearRect(0, 148, W - 1, 175);
   if (!cal || !ui.linked) g.setColor(1, 1, 0); else g.setColor(1, 1, 1);
-  g.setFont("Vector", 18).drawString(foot, W / 2, 160);
+  g.setFontAlign(0, 0).setFont("Vector", 18).drawString(foot, W / 2, 160);
 }
 
 // Uhrzeit zur vollen Minute nachziehen.
@@ -630,11 +645,12 @@ var NP = {
     var r = sway(ms);
     // Nur ungestoerte Messungen auf das Zifferblatt: ein Wert aus einem
     // verzerrten Feld ist keiner.
+    // Erst antworten, dann zeichnen: das Telefon wartet auf die Zahl.
+    out(r);
     if (r.a != null && r.f > 0.65 && r.f < 1.35) {
       ui.sway = r.a;
-      if (!ui.cue && !calRun) draw();
+      if (!ui.cue && !calRun) drawFoot();
     }
-    out(r);
   },
   cue: function (items, sub, buzz) { if (!calRun) showCue(items, sub, buzz); },
   cfg: function (o) { ui.thr = o.thr || 0; if (!ui.cue && !calRun) draw(); },
@@ -1015,7 +1031,7 @@ function recSwing(clip, step, st, counted, pts) {
 
 const REC_COLUMNS = ['timestamp', 't_ms', 'side', 'phase', 'step', 'x_m', 'y_m', 'z_m', 'flex_deg',
   'step_length_m', 'step_height_m', 'step_max_flex_deg', 'step_flex_range_deg', 'step_turn_deg',
-  'curve', 'stairs', 'excluded', 'vibration', 'step_arm_sway_deg', 'arm_vibration'];
+  'curve', 'stairs', 'excluded', 'vibration', 'step_arm_sway_deg', 'arm_vibration', 'step_arm_note'];
 
 const stamp = ms => {
   const d = new Date(ms);
@@ -1038,6 +1054,7 @@ function recCsv(side) {
       s ? +!!(s.flags & F.CURVE) : '', s ? +!!(s.flags & F.STAIRS) : '',
       s ? +!!(s.flags & F.EXCLUDED) : '', s ? +!!(s.flags & F.VIBRATE) : '',
       s && s.arm != null ? s.arm.toFixed(1) : '', s ? +!!s.armCue : '',
+      s && s.armNote ? s.armNote : '',
     ].join(','));
   }
   return lines.join('\n') + '\n';
@@ -1159,6 +1176,7 @@ function parseCsv(text) {
         // Uhr nicht messen konnte.
         if (c.step_arm_sway_deg >= 0 && v[c.step_arm_sway_deg] !== '') step.arm = +v[c.step_arm_sway_deg];
         if (c.arm_vibration >= 0 && v[c.arm_vibration] === '1') step.armCue = true;
+        if (c.step_arm_note >= 0 && v[c.step_arm_note]) step.armNote = v[c.step_arm_note];
         map.set(no, step);
         sd.steps.push(step);
       }
@@ -1732,7 +1750,8 @@ function renderFeed() {
     const [cls, txt] = stepOutcome(s);
     return `<li><b>${s.side}${pad(s.no, 3)}</b>`
       + `<span>${num(s.len, 2)} m</span><span>Auftrittswinkel ${num(s.maxflex, 0)}°</span><span>Winkelumfang ${num(s.range, 0)}°</span>`
-      + (s.arm != null ? `<span>Arm ${num(s.arm, 0)}°</span>` : '')
+      + (s.arm != null ? `<span>Arm ${num(s.arm, 0)}°</span>`
+         : s.armNote ? `<span class="hint">Arm – (${ARM_NOTE[s.armNote]})</span>` : '')
       + `<span class="what ${cls}">${txt}</span></li>`;
   }).join('');
 }
@@ -1781,7 +1800,7 @@ const STRIDE_MIN_MS = 600;
 const STRIDE_MAX_MS = 2500;
 // Ein Schritt, der erst so spät fertig wird (Aufnahme-Ende, fehlende
 // 'P'-Frames), liegt nicht mehr im Fenster der Uhr — kein Wert, kein Reiz.
-const STEP_LATE_MS = 1500;
+const STEP_LATE_MS = 2500;
 // Feldstärke relativ zur Kalibrierung; außerhalb verbiegt Eisen das Feld,
 // der Winkel daraus ist keiner. Dieselben Grenzen wie auf der Uhr.
 const FIELD_OK_LO = 0.65, FIELD_OK_HI = 1.35;
@@ -2012,9 +2031,19 @@ function bangleCue(w, items, sub, buzzMs) {
 const armEligible = s => !(s.flags & (F.CURVE | F.STAIRS | F.EXCLUDED | F.LOCKOUT))
                       && !state.clips.some(c => c.lockout);
 
+// Warum ein Schritt keinen Armwert hat — in der Schrittliste und in der CSV
+// (step_arm_note), damit ein Feldtest zeigt, woran es lag, statt nur einer
+// Lücke. Ohne verbundene Uhr bleibt die Notiz leer.
+const ARM_NOTE = {
+  first: 'erster Schritt', pause: 'nach Pause', late: 'Schritt kam zu spät',
+  timeout: 'Uhr antwortet nicht', thin: 'zu wenig Kompasswerte', field: 'Magnetfeld gestört',
+  cal: 'Uhr nicht kalibriert',
+};
+
 async function bangleOnStep(clip, step, strideMs) {
   const w = bangleUsable();
-  if (!w || Date.now() - step.t1 > STEP_LATE_MS) return;
+  if (!w) return;
+  if (Date.now() - step.t1 > STEP_LATE_MS) { step.armNote = 'late'; renderFeed(); return; }
 
   // Zielwert aus der Einstellung, die gerade in der App steht: dieselbe, die
   // der Clip hat — hydrate() und pushSettings() halten beide gleich.
@@ -2023,21 +2052,27 @@ async function bangleOnStep(clip, step, strideMs) {
         .map(c => ({ t: c.t, v: c.v(step), z: c.z(state.fb[c.key].v), sub: c.sub }))
     : [];
   let armCue = false;
-  if (w.cal && strideMs >= STRIDE_MIN_MS && strideMs <= STRIDE_MAX_MS) {
+  if (!w.cal) step.armNote = 'cal';
+  else if (!strideMs) step.armNote = 'first';
+  else if (strideMs < STRIDE_MIN_MS || strideMs > STRIDE_MAX_MS) step.armNote = 'pause';
+  else {
     const r = await bangleAsk(w, guard(`NP.s(${Math.round(strideMs)})`), 's', 1500);
-    if (r?.why === 'cal') { w.cal = false; renderWatch(); }
-    else if (r && r.a != null) {
+    if (!r) step.armNote = 'timeout';
+    else if (r.why === 'cal') { step.armNote = 'cal'; w.cal = false; renderWatch(); }
+    else if (r.a == null) step.armNote = 'thin';
+    else {
       w.disturbed = !(r.f > FIELD_OK_LO && r.f < FIELD_OK_HI);
-      if (!w.disturbed) {
+      if (w.disturbed) step.armNote = 'field';
+      else {
         step.arm = r.a;
         state.armLast = r.a;
         armCue = state.arm.on && r.a < state.arm.v && armEligible(step);
         if (armCue) step.armCue = true;
-        renderFeed();
       }
       renderArmRead();
     }
   }
+  renderFeed();
   if (armCue) reasons.push({ t: ARM_TEXT.t, v: ARM_TEXT.v(step), z: ARM_TEXT.z(state.arm.v), sub: ARM_TEXT.sub });
   if (!reasons.length || state.bangle !== w) return;
   // Der Hinweis nur bei einem Grund: bei mehreren braucht der Schirm den
