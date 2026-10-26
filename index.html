@@ -699,8 +699,21 @@ const UNLOCK_TOKEN = 'Np4x7Qr2';
 const SAMPLE_MS = 10;        // SAMPLE_RATE_HZ = 100
 const TRAJ_DECIMATION = 4;   // config.h
 // How long a step waits for missing 'P' frames before it is assembled with
-// what arrived. The clip sends a whole trajectory within ~100–200 ms.
-const TRAJ_WAIT_MS = 800;
+// what arrived. On a good link the clip sends a whole trajectory within
+// ~100–200 ms.
+//
+// It used to be a fixed 800 ms from the summary, and any newer summary closed
+// the step at once. Both cut trajectories off on a slow link: the clip sends a
+// new step's 'S' frame AHEAD of the previous step's remaining 'P' frames, so
+// whenever a trajectory took longer than one step to get through, the next
+// summary truncated it — in the 2026-10-26 17:53 recording only 37 % of the
+// points arrived, and the rest were drawn as straight lines with no height.
+// Now a step stays open while its frames keep coming: it closes once
+// TRAJ_IDLE_MS pass without a new frame for it, or after TRAJ_MAX_WAIT_MS at
+// the latest. Steps are still finished in the order their summaries arrived,
+// because each one's positions build on the previous one's end point.
+const TRAJ_IDLE_MS = 1000;
+const TRAJ_MAX_WAIT_MS = 5000;
 // STEPLEN_ARTIFACT_MAX_M, config.h: shorter is a segmentation glitch.
 const ARTIFACT_MAX_M = 0.05;
 
@@ -787,6 +800,8 @@ async function connect() {
       live: [],            // recent { tc, flex } from status frames, for gap filling
       liveFlex: null, lastStep: null, stepNo: 0, lastSwingEnd: -Infinity,
       prevStepEnd: null,   // Ende des vorigen echten Schritts: Doppelschrittdauer für die Uhr
+      order: [],           // seqs in summary order, finished strictly in this order
+      done: [],            // recently finished seqs, so late 'P' frames are dropped
       batt: null, lockout: false,
     };
     // Unlock first: until then the clip ignores commands and sends nothing,
@@ -883,14 +898,19 @@ function onStepFrame(clip, dv) {
       maxflex: dv.getInt16(14, true) / 10, range: dv.getInt16(16, true) / 10,
       turn: dv.getInt8(18), flags: dv.getUint8(19),
     };
-    // A newer summary closes any older step still waiting for its points.
-    for (const [seq, e] of clip.pend) if (seq !== s.seq && e.s) completeStep(clip, seq);
     const e = pendEntry(clip, s.seq);
     e.s = s;
-    if (s.npts === 0 || e.got >= s.npts) completeStep(clip, s.seq);
-    else e.timer = setTimeout(() => completeStep(clip, s.seq), TRAJ_WAIT_MS);
+    e.deadline = Date.now() + TRAJ_MAX_WAIT_MS;
+    clip.order.push(s.seq);
+    onSummary(clip, e);
+    if (s.npts === 0 || e.got >= s.npts) { e.ready = true; flushSteps(clip); }
+    else armTrajTimer(clip, s.seq, e);
   } else if (tag === 0x50) {                            // 'P'
     const seq = dv.getUint8(1), first = dv.getUint8(2), count = dv.getUint8(3);
+    // Too late for a step that was already finished: drop it rather than
+    // leave an orphan entry that a later step with the same (wrapped) seq
+    // number could pick up.
+    if (!clip.pend.has(seq) && clip.done.includes(seq)) return;
     const e = pendEntry(clip, seq);
     for (let k = 0; k < count && 4 + 8 * k + 8 <= dv.byteLength; k++) {
       const o = 4 + 8 * k;
@@ -898,17 +918,60 @@ function onStepFrame(clip, dv) {
       e.pts[first + k] = { x: dv.getInt16(o, true) / 1000, y: dv.getInt16(o + 2, true) / 1000,
                            z: dv.getInt16(o + 4, true) / 1000, flex: dv.getInt16(o + 6, true) / 10 };
     }
-    if (e.s && e.got >= e.s.npts) completeStep(clip, seq);
+    if (e.s && !e.ready) {
+      if (e.got >= e.s.npts) { clearTimeout(e.timer); e.ready = true; flushSteps(clip); }
+      else armTrajTimer(clip, seq, e);
+    }
   }
+}
+
+// (Re)start the wait for a step's remaining points: TRAJ_IDLE_MS after the
+// latest frame, never past the step's hard deadline.
+function armTrajTimer(clip, seq, e) {
+  clearTimeout(e.timer);
+  const wait = Math.max(0, Math.min(TRAJ_IDLE_MS, e.deadline - Date.now()));
+  e.timer = setTimeout(() => { e.ready = true; flushSteps(clip); }, wait);
+}
+
+// Finish every step at the head of the queue that is ready, in arrival order.
+function flushSteps(clip) {
+  while (clip.order.length) {
+    const e = clip.pend.get(clip.order[0]);
+    if (e && !e.ready) break;
+    const seq = clip.order.shift();
+    if (e) completeStep(clip, seq);
+  }
+}
+
+// What can be done the moment a step's summary arrives, without waiting for
+// its trajectory: the watch measures the arm swing over the stride that has
+// JUST ended, so asking only after a slow trajectory would measure the wrong
+// one. The step object is created here and completed later in completeStep(),
+// so the arm result lands on the same object whichever comes first.
+function onSummary(clip, e) {
+  const s = e.s;
+  if (clip.offset == null) clip.offset = Date.now() - (s.start + SAMPLE_MS * s.n) - 150;
+  const n = Math.max(2, s.n);
+  const len = Math.hypot(s.dx, s.dy);
+  e.step = { side: clip.side, len, h: s.dz, maxflex: s.maxflex, range: s.range, turn: s.turn, flags: s.flags,
+             t0: s.start + clip.offset, t1: s.start + SAMPLE_MS * (n - 1) + clip.offset };
+  if (len < ARTIFACT_MAX_M) return;
+  const stride = clip.prevStepEnd == null ? 0 : e.step.t1 - clip.prevStepEnd;
+  clip.prevStepEnd = e.step.t1;
+  bangleOnStep(clip, e.step, stride);
 }
 
 function pendEntry(clip, seq) {
   let e = clip.pend.get(seq);
   if (!e) {
-    e = { s: null, pts: [], got: 0, timer: null };
+    e = { s: null, pts: [], got: 0, timer: null, ready: false };
     clip.pend.set(seq, e);
     // Points whose summary never came (should not happen) must not pile up.
-    if (clip.pend.size > 6) clip.pend.delete(clip.pend.keys().next().value);
+    // Only such orphans are evicted: a step that has its summary is still
+    // waiting for its points, and on a slow link several can be in flight.
+    if (clip.pend.size > 12) {
+      for (const [k, v] of clip.pend) if (!v.s) { clip.pend.delete(k); break; }
+    }
   }
   return e;
 }
@@ -926,8 +989,9 @@ function completeStep(clip, seq) {
   if (!e || !e.s) return;
   clearTimeout(e.timer);
   clip.pend.delete(seq);
+  clip.done.push(seq);
+  if (clip.done.length > 16) clip.done.shift();
   const s = e.s;
-  if (clip.offset == null) clip.offset = Date.now() - (s.start + SAMPLE_MS * s.n) - 150;
 
   // Buffer index of every point: k*D, the last one on n-1 (ble.h).
   const n = Math.max(2, s.n);
@@ -969,12 +1033,11 @@ function completeStep(clip, seq) {
   // step list or the tiles: its rows carry the previous real step's values.
   const artifact = len < ARTIFACT_MAX_M;
   if (!artifact) clip.stepNo++;
-  const step = {
-    no: clip.stepNo, side: clip.side,
-    t0: s.start + clip.offset, t1: s.start + SAMPLE_MS * (n - 1) + clip.offset,
-    len, h: s.dz, maxflex: s.maxflex, range: s.range,
-    turn: s.turn, flags: s.flags, partial: s.npts === 0 || e.got < s.npts,
-  };
+  // Same object onSummary() made, so an arm value that already arrived stays.
+  const step = Object.assign(e.step, {
+    no: clip.stepNo, partial: s.npts === 0 || e.got < s.npts,
+    traj: [Math.min(e.got, s.npts), s.npts],
+  });
   clip.lastSwingEnd = step.t1;
   if (!artifact) clip.lastStep = step;
 
@@ -987,10 +1050,6 @@ function completeStep(clip, seq) {
   if (state.feed.length > 8) state.feed.length = 8;
   renderFeed();
   renderTiles();
-
-  const stride = clip.prevStepEnd == null ? 0 : step.t1 - clip.prevStepEnd;
-  clip.prevStepEnd = step.t1;
-  bangleOnStep(clip, step, stride);
 }
 
 // =====================================================================
@@ -1031,7 +1090,8 @@ function recSwing(clip, step, st, counted, pts) {
 
 const REC_COLUMNS = ['timestamp', 't_ms', 'side', 'phase', 'step', 'x_m', 'y_m', 'z_m', 'flex_deg',
   'step_length_m', 'step_height_m', 'step_max_flex_deg', 'step_flex_range_deg', 'step_turn_deg',
-  'curve', 'stairs', 'excluded', 'vibration', 'step_arm_sway_deg', 'arm_vibration', 'step_arm_note'];
+  'curve', 'stairs', 'excluded', 'vibration', 'step_arm_sway_deg', 'arm_vibration', 'step_arm_note',
+  'traj_received'];
 
 const stamp = ms => {
   const d = new Date(ms);
@@ -1055,6 +1115,11 @@ function recCsv(side) {
       s ? +!!(s.flags & F.EXCLUDED) : '', s ? +!!(s.flags & F.VIBRATE) : '',
       s && s.arm != null ? s.arm.toFixed(1) : '', s ? +!!s.armCue : '',
       s && s.armNote ? s.armNote : '',
+      // Trajectory points that arrived / that the clip sent. 0/0: the clip
+      // sent none (its one trajectory slot was still busy with the previous
+      // step); n/m with n < m: points lost or too late, the rest of the
+      // swing is interpolated and has no real height.
+      s && s.traj ? s.traj.join('/') : '',
     ].join(','));
   }
   return lines.join('\n') + '\n';
@@ -1084,7 +1149,10 @@ function recStop() {
   rec.on = false;
   releaseWakeLock();
   // Steps still waiting for their points belong in the file.
-  for (const c of state.clips) for (const seq of [...c.pend.keys()]) completeStep(c, seq);
+  for (const c of state.clips) {
+    for (const e of c.pend.values()) { clearTimeout(e.timer); e.ready = true; }
+    flushSteps(c);
+  }
   const sides = ['L', 'R'].filter(s => rec.rows[s].length);
   const base = fileBase(rec.started);
   // Staggered: two downloads in the same tick, and Chrome drops the second.
