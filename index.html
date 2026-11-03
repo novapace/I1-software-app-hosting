@@ -13,9 +13,9 @@
      --sideL / --sideR are the two foot series in the 3D view and the step
      list. Checked with the dataviz validator against white: lightness band,
      chroma, colour-blind separation (worst protan dE 21.9) and 3:1 contrast
-     all pass. They are only used inside the 3D view and its legend and
-     readout — text stays in --fg/--dim, and every coloured mark carries an
-     "L"/"R" label next to it. */
+     all pass. They are used in the 3D view, its legend and readout, and the
+     clip chips' connection dots — text stays in --fg/--dim, and every
+     coloured mark carries an "L"/"R" label next to it. */
   :root {
     --brand: #458d7f; --brand-lt: #8ec68b;
     --bg: #ffffff; --panel: #f4f8f7;
@@ -76,13 +76,13 @@
   .clips { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .chip { display: flex; align-items: center; gap: 6px; background: #fff; border: 1px solid var(--grid);
           border-radius: 999px; padding: 6px 8px 6px 12px; font-size: 16px; font-weight: 600; }
-  /* "Connected" dot. Neutral on purpose: the foot colours (--sideL/R) only
-     mean something inside the 3D view; outside it a coloured dot reads as a
-     status signal. */
+  /* "Connected" dot, in the foot colour of the 3D view and its video, so a
+     chip and its trajectory read as the same foot. */
   .chip .dot { width: 10px; height: 10px; border-radius: 50%; }
-  /* Two greys, so the chips still tell the feet apart at a glance. */
-  .chip .dot.L { background: #5c5c5c; }
-  .chip .dot.R { background: #b4b4b4; }
+  .chip .dot.L { background: var(--sideL); }
+  .chip .dot.R { background: var(--sideR); }
+  /* The watch belongs to neither foot. */
+  .chip .dot.W { background: var(--dim); }
   .chip .batt .shell { fill: none; stroke: var(--dim); stroke-width: 1.2; }
   .chip .batt .cap   { fill: var(--dim); }
   .chip .batt .cell  { fill: none; }
@@ -364,7 +364,9 @@ var BUZZ_QUIET_S = 0.1;
 var POLL_HZ = 12.5;   // Bangle.setPollInterval(80) unten
 var MIN_COVER = 0.7;
 var CUE_MS = 8000;
-var ui = { sway: null, thr: 0, cue: null, cueTimer: 0, linked: NRF.getSecurityStatus().connected };
+// st: was das Telefon gerade tut, vom Telefon gesetzt (NP.cfg) -- "r" Messung
+// (Aufnahme), "f" Feedback eingeschaltet, "" keins von beiden.
+var ui = { st: "", cue: null, cueTimer: 0, linked: NRF.getSecurityStatus().connected };
 
 function out(o) { Bluetooth.println("NP:" + JSON.stringify(o)); }
 
@@ -616,18 +618,21 @@ function draw() {
   drawFoot();
 }
 
-// Nur die unterste Zeile. Nach jeder Messung reicht das, und es ist billig:
-// ein ganzes Neuzeichnen (Logo, Uhrzeit) haelt die Uhr so lange auf, dass
-// die Kompasswerte in der Warteschlange stauen (s. MIN_COVER).
+// Nur die unterste Zeile, der Zustand. Bei einem Wechsel reicht das, und es
+// ist billig: ein ganzes Neuzeichnen (Logo, Uhrzeit) haelt die Uhr so lange
+// auf, dass die Kompasswerte in der Warteschlange stauen (s. MIN_COVER).
 function drawFoot() {
   var W = g.getWidth();
-  var foot = !cal ? "nicht kalibriert"
-           : !ui.linked ? "Telefon getrennt"
-           : ui.sway == null ? ""
-           : "Arm " + Math.round(ui.sway) + "\xB0" + (ui.thr > 0 ? " \xB7 Ziel " + ui.thr + "\xB0" : "");
+  var foot = !ui.linked ? "Nicht verbunden"
+           : !cal ? "nicht kalibriert"
+           : ui.st == "r" ? "Messung l\xE4uft"
+           : ui.st == "f" ? "Feedback aktiviert"
+           : "Standby";
   g.reset().setBgColor(0, 0, 0).clearRect(0, 148, W - 1, 175);
   if (!cal || !ui.linked) g.setColor(1, 1, 0); else g.setColor(1, 1, 1);
-  g.setFontAlign(0, 0).setFont("Vector", 18).drawString(foot, W / 2, 160);
+  g.setFontAlign(0, 0).setFont("Vector", 18);
+  if (g.stringWidth(foot) > W - 8) g.setFont("Vector", 16);
+  g.drawString(foot, W / 2, 160);
 }
 
 // Uhrzeit zur vollen Minute nachziehen.
@@ -641,19 +646,9 @@ function minuteTick() {
 var NP = {
   h: VER,
   hi: function () { out({ t: "hi", h: VER, cal: !!cal, bat: E.getBattery() }); },
-  s: function (ms) {
-    var r = sway(ms);
-    // Nur ungestoerte Messungen auf das Zifferblatt: ein Wert aus einem
-    // verzerrten Feld ist keiner.
-    // Erst antworten, dann zeichnen: das Telefon wartet auf die Zahl.
-    out(r);
-    if (r.a != null && r.f > 0.65 && r.f < 1.35) {
-      ui.sway = r.a;
-      if (!ui.cue && !calRun) drawFoot();
-    }
-  },
+  s: function (ms) { out(sway(ms)); },
   cue: function (items, sub, buzz) { if (!calRun) showCue(items, sub, buzz); },
-  cfg: function (o) { ui.thr = o.thr || 0; if (!ui.cue && !calRun) draw(); },
+  cfg: function (o) { ui.st = o.st || ""; if (!ui.cue && !calRun) drawFoot(); },
   cal: function () { calStart(); }
 };
 
@@ -1178,6 +1173,7 @@ function renderRec() {
   } else if (recLastMsg) {
     $('recInfo').textContent = recLastMsg;
   }
+  pushBangleCfg();
 }
 setInterval(() => { if (rec.on) renderRec(); }, 1000);
 
@@ -1722,6 +1718,7 @@ function renderThresholds() {
   $('pulseBtn').disabled = !connected;
   document.querySelectorAll('[data-for="intensity"]').forEach(b => { b.disabled = !connected; });
   renderStats();
+  pushBangleCfg();
 }
 
 const pushThresholdNow = k => broadcast(thrCmd(k));
@@ -1971,7 +1968,7 @@ function onBangleMsg(w, msg) {
     w.cal = !!msg.cal;
     if (msg.bat != null) w.batt = msg.bat;
     w.launching = false;
-    pushBangleCfg();
+    pushBangleCfg(true);
     renderWatch();
   } else if (msg.t === 'gone' && w.ready && !w.launching) {
     w.ready = false;
@@ -2029,7 +2026,7 @@ async function ensureBangleApp(w) {
     w.ready = true;
     w.cal = !!st?.cal;
     if (st?.bat != null) w.batt = st.bat;
-    pushBangleCfg();
+    pushBangleCfg(true);
     renderWatch();
     return;
   }
@@ -2082,9 +2079,18 @@ function disconnectBangle() {
 }
 
 const bangleUsable = () => state.bangle?.ready ? state.bangle : null;
-function pushBangleCfg() {
+// Der Zustand unten auf der Uhr: Messung (Aufnahme läuft) vor Feedback
+// (irgendeine Schwelle eingeschaltet, Clip oder Armschwung), sonst Standby.
+// Nur bei einer Änderung gesendet — renderRec() und renderThresholds() rufen
+// das bei jedem Neuzeichnen; force nach einem (Neu-)Start der Uhr-App.
+function pushBangleCfg(force) {
   const w = bangleUsable();
-  if (w) bangleCall(w, `NP.cfg({thr:${state.arm.on ? state.arm.v : 0}})`);
+  if (!w) return;
+  const fbOn = state.arm.on || Object.values(state.fb).some(t => t.on);
+  const cmd = `NP.cfg({st:"${rec.on ? 'r' : fbOn ? 'f' : ''}"})`;
+  if (!force && cmd === w.cfgSent) return;
+  w.cfgSent = cmd;
+  bangleCall(w, cmd);
 }
 const pushArmCfg = debounce(pushBangleCfg, 300);
 
@@ -2201,7 +2207,7 @@ function renderWatch() {
     el.className = 'chip';
     // Dasselbe Akkusymbol wie bei den Clips; die Uhr meldet ihren Stand
     // beim Start und dann jede Minute ("bat").
-    el.innerHTML = '<span class="dot L"></span>Uhr' + batteryIcon({ batt: w.batt });
+    el.innerHTML = '<span class="dot W"></span>Uhr' + batteryIcon({ batt: w.batt });
     const x = document.createElement('button');
     x.textContent = '✕';
     x.setAttribute('aria-label', 'Uhr trennen');
