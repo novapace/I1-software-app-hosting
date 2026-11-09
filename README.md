@@ -2,13 +2,19 @@
 
 DISCLAIMER: DIESER FUNKTIONSUMFANG IST REIN FÜR PRÄSENTATIONSZWECKE UND SOLLTE NICHT FÜR PATIENTEN GENUTZT WERDEN
 
-Kurzzusammenfassung I1: I1 stellt eine Plattform für das individualisierte Feedback von Probanden zur Verfügung.
+## Kurzzusammenfassung I1: 
+
+I1 stellt eine Plattform für das individualisierte Feedback von Probanden zur Verfügung.
 Es werden die Sohlen und optional die Smartwatch (Bangle2) verbunden und die folgenden Aktivitäten durchgeführt werden:
 - Aufzeichnung der Fußtrajektorie und -winkel
 - Anzeige / Analyse der Aufzeichnung
 - individuelle Einstellung von Feedback in Abhängigkeit der Gangparameter
 
-Web-App für den novapace Clip mit der Firmware „individualized therapy“:
+MVP-Video: https://drive.google.com/file/d/1gIYK4rybuvTj4EemFWgudNiNskFaJsH2/view?usp=sharing 
+
+## Kurzzusammenfassung dieses Repos:
+
+Web-App für den novapace Clip mit der Firmware „I1“:
 Gangdaten aufnehmen, in 3D ansehen und daraus individuelle
 Vibrationsschwellen setzen. Läuft im Browser über Web Bluetooth (Chrome).
 
